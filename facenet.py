@@ -1,42 +1,123 @@
+from keras import backend as K
+import time
+from multiprocessing.dummy import Pool
+K.set_image_data_format('channels_first')
+import cv2
 import os
 import glob
 import numpy as np
-import cv2
+from numpy import genfromtxt
 import tensorflow as tf
 from fr_utils import *
-import dlib
-import imutils
-from imutils import face_utils
 from inception_blocks_v2 import *
-from keras import backend as K
-K.set_image_data_format('channels_first')
-from imutils.face_utils import FaceAligner
+from mtcnn.mtcnn import MTCNN
+ready_to_detect_identity = True
 
 FRmodel = faceRecoModel(input_shape=(3, 96, 96))
+detector = MTCNN()
 def triplet_loss(y_true, y_pred, alpha = 0.3):
+    """
+    Implementation of the triplet loss as defined by formula (3)
+
+    Arguments:
+    y_pred -- python list containing three objects:
+            anchor -- the encodings for the anchor images, of shape (None, 128)
+            positive -- the encodings for the positive images, of shape (None, 128)
+            negative -- the encodings for the negative images, of shape (None, 128)
+
+    Returns:
+    loss -- real number, value of the loss
+    """
+
     anchor, positive, negative = y_pred[0], y_pred[1], y_pred[2]
 
-    pos_dist = tf.reduce_sum(tf.square(tf.subtract(anchor,
-               positive)), axis=-1)
-    neg_dist = tf.reduce_sum(tf.square(tf.subtract(anchor,
-               negative)), axis=-1)
+    pos_dist = tf.reduce_sum(tf.square(tf.subtract(anchor, positive)), axis=-1)
+    neg_dist = tf.reduce_sum(tf.square(tf.subtract(anchor, negative)), axis=-1)
     basic_loss = tf.add(tf.subtract(pos_dist, neg_dist), alpha)
     loss = tf.reduce_sum(tf.maximum(basic_loss, 0.0))
 
     return loss
+
 FRmodel.compile(optimizer = 'adam', loss = triplet_loss, metrics = ['accuracy'])
 load_weights_from_FaceNet(FRmodel)
 
+def prepare_database():
+    database = {}
+    for file in glob.glob("Images/*"):
+        for image in glob.glob(os.path.join(file,"*")):
+            identity = os.path.dirname(image)
+            database[identity] = img_path_to_encoding(image, FRmodel)
+    return database
 
+def webcam_face_recognizer(database):
+    """
+    Runs a loop that extracts images from the computer's webcam and determines whether or not
+    it contains the face of a person in our database.
 
-detector = dlib.get_frontal_face_detector()
-predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
-fa = FaceAligner(predictor, desiredFaceWidth=256)
+    If it contains a face, an audio message will be played welcoming the user.
+    If not, the program will process the next frame from the webcam
+    """
+    global ready_to_detect_identity
 
+    cv2.namedWindow("preview")
+    vc = cv2.VideoCapture(0)
 
-cap = cv2.VideoCapture(0)
+    while vc.isOpened():
+        ret, frame = vc.read()
+        img = frame
+
+        # We do not want to detect a new identity while the program is in the process of identifying another person
+        if ready_to_detect_identity:
+            img = process_frame(img, frame)
+
+        key = cv2.waitKey(100)
+        cv2.imshow("preview", img)
+
+        if key == 27: # exit on ESC
+            break
+    cv2.destroyWindow("preview")
+
+def process_frame(img, frame):
+    """
+    Determine whether the current frame contains the faces of people from our database
+    """
+    global ready_to_detect_identity
+    result = detector.detect_faces(frame)
+    rects = result
+    # Loop through all the faces detected and determine whether or not they are in the database
+    identities = []
+    for (i,rect) in enumerate(rects):
+        (x,y,w,h) = rect['box'][0],rect['box'][1],rect['box'][2],rect['box'][3]
+        img = cv2.rectangle(frame,(x, y),(x+w, y+h),(255,0,0),2)
+
+        identity = find_identity(frame, x, y, x+w, y+h)
+
+        if identity is not None:
+            identities.append(identity)
+
+    if identities != []:
+        cv2.imwrite('example.png',img)
+
+    return img
+
+def find_identity(frame, x1, y1, x2, y2):
+    """
+    Determine whether the face contained within the bounding box exists in our database
+
+    x1,y1_____________
+    |                 |
+    |                 |
+    |_________________x2,y2
+
+    """
+    height, width, channels = frame.shape
+    # The padding is necessary since the OpenCV face detector creates the bounding box around the face and not the head
+    part_image = frame[max(0, y1):min(height, y2), max(0, x1):min(width, x2)]
+
+    return who_is_it(part_image, database, FRmodel)
 
 def who_is_it(image, database, model):
+
     encoding = img_to_encoding(image, model)
 
     min_dist = 100
@@ -44,60 +125,25 @@ def who_is_it(image, database, model):
 
     # Loop over the database dictionary's names and encodings.
     for (name, db_enc) in database.items():
+
+        # Compute L2 distance between the target "encoding" and the current "emb" from the database.
         dist = np.linalg.norm(db_enc - encoding)
+
         print('distance for %s is %s' %(name, dist))
+
+        # If this distance is less than the min_dist, then set min_dist to dist, and identity to name
         if dist < min_dist:
             min_dist = dist
             identity = name
 
-    if min_dist > 1.00:
+    if min_dist > 1.10:
         return None
     else:
-        return identity
-def recognize():
-    while(True):
-        ret, frame = cap.read()
-        image = imutils.resize(frame, width=500)
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        return str(identity)
 
-        rects = detector(gray,1)
+    # Allow the program to start detecting identities again
+    ready_to_detect_identity = True
 
-        for (i,rect) in enumerate(rects):
-            shape = predictor(gray,rect)
-            shape = face_utils.shape_to_np(shape)
-
-            (x,y,w,h) = face_utils.rect_to_bb(rect)
-            cv2.rectangle(image,(x,y),(x+w,y+h),(0,255,0),2)
-
-            for (x,y) in shape:
-                cv2.circle(image,(x,y),1,(0,0,255),-1)
-
-            faceOrig = imutils.resize(image[y:y + h, x:x + w], width=256)
-            faceAligned = fa.align(image, gray, rect)
-
-            identity = who_is_it(faceAligned, database, FRmodel)
-            print(identity)
-        cv2.imshow("Output", image)
-        if cv2.waitKey(20) & 0xFF == ord('q'):
-            break
-
-    cap.release()
-    cap.destroyAllWindows()
-
-
-def prepare_database():
-    database = {}
-    for file in glob.glob("Images/*"):
-        for image in glob.glob(os.path.join(file,"*")):
-            identity = os.path.dirname(image)
-            image = imutils.resize(image, width=500)
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            rect = detector(gray,1)
-            faceOrig = imutils.resize(image[y:y + h, x:x + w], width=256)
-            faceAligned = fa.align(image, gray, rect)
-            database[identity] = img_path_to_encoding(faceAligned, FRmodel)
-    return database
-
-if __name__=='__main__':
+if __name__ == "__main__":
     database = prepare_database()
-    recognize()
+    webcam_face_recognizer(database)
