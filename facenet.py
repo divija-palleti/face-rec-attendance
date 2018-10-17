@@ -8,38 +8,47 @@ import glob
 import numpy as np
 from numpy import genfromtxt
 import tensorflow as tf
+from keras.models import load_model
 from fr_utils import *
 from inception_blocks_v2 import *
 from mtcnn.mtcnn import MTCNN
+import dlib
+from imutils import face_utils
+import imutils
+
 ready_to_detect_identity = True
 
-FRmodel = faceRecoModel(input_shape=(3, 96, 96))
-detector = MTCNN()
-def triplet_loss(y_true, y_pred, alpha = 0.3):
-    """
-    Implementation of the triplet loss as defined by formula (3)
-
-    Arguments:
-    y_pred -- python list containing three objects:
-            anchor -- the encodings for the anchor images, of shape (None, 128)
-            positive -- the encodings for the positive images, of shape (None, 128)
-            negative -- the encodings for the negative images, of shape (None, 128)
-
-    Returns:
-    loss -- real number, value of the loss
-    """
-
-    anchor, positive, negative = y_pred[0], y_pred[1], y_pred[2]
-
-    pos_dist = tf.reduce_sum(tf.square(tf.subtract(anchor, positive)), axis=-1)
-    neg_dist = tf.reduce_sum(tf.square(tf.subtract(anchor, negative)), axis=-1)
-    basic_loss = tf.add(tf.subtract(pos_dist, neg_dist), alpha)
-    loss = tf.reduce_sum(tf.maximum(basic_loss, 0.0))
-
-    return loss
-
-FRmodel.compile(optimizer = 'adam', loss = triplet_loss, metrics = ['accuracy'])
-load_weights_from_FaceNet(FRmodel)
+FRmodel = load_model('face-rec_Google.h5')
+detector = dlib.get_frontal_face_detector()
+# FRmodel = faceRecoModel(input_shape=(3, 96, 96))
+#
+# # detector = dlib.get_frontal_face_detector()
+# # predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
+# def triplet_loss(y_true, y_pred, alpha = 0.3):
+#     """
+#     Implementation of the triplet loss as defined by formula (3)
+#
+#     Arguments:
+#     y_pred -- python list containing three objects:
+#             anchor -- the encodings for the anchor images, of shape (None, 128)
+#             positive -- the encodings for the positive images, of shape (None, 128)
+#             negative -- the encodings for the negative images, of shape (None, 128)
+#
+#     Returns:
+#     loss -- real number, value of the loss
+#     """
+#
+#     anchor, positive, negative = y_pred[0], y_pred[1], y_pred[2]
+#
+#     pos_dist = tf.reduce_sum(tf.square(tf.subtract(anchor, positive)), axis=-1)
+#     neg_dist = tf.reduce_sum(tf.square(tf.subtract(anchor, negative)), axis=-1)
+#     basic_loss = tf.add(tf.subtract(pos_dist, neg_dist), alpha)
+#     loss = tf.reduce_sum(tf.maximum(basic_loss, 0.0))
+#
+#     return loss
+#
+# FRmodel.compile(optimizer = 'adam', loss = triplet_loss, metrics = ['accuracy'])
+# load_weights_from_FaceNet(FRmodel)
 
 def prepare_database():
     database = {}
@@ -64,33 +73,32 @@ def webcam_face_recognizer(database):
 
     while vc.isOpened():
         ret, frame = vc.read()
+        img_rgb = cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)
         img = frame
-
         # We do not want to detect a new identity while the program is in the process of identifying another person
         if ready_to_detect_identity:
-            img = process_frame(img, frame)
+            img = process_frame(img_rgb, frame)
 
-        key = cv2.waitKey(100)
-        cv2.imshow("preview", img)
+        cv2.imshow("Preview", img)
+        cv2.waitKey(1)
 
-        if key == 27: # exit on ESC
-            break
-    cv2.destroyWindow("preview")
+    vc.release()
 
 def process_frame(img, frame):
     """
     Determine whether the current frame contains the faces of people from our database
     """
     global ready_to_detect_identity
-    result = detector.detect_faces(frame)
-    rects = result
+    # rects = detector(img)
+    rects = detector(img)
     # Loop through all the faces detected and determine whether or not they are in the database
     identities = []
     for (i,rect) in enumerate(rects):
-        (x,y,w,h) = rect['box'][0],rect['box'][1],rect['box'][2],rect['box'][3]
+        (x,y,w,h) = face_utils.rect_to_bb(rect)
         img = cv2.rectangle(frame,(x, y),(x+w, y+h),(255,0,0),2)
 
         identity = find_identity(frame, x, y, x+w, y+h)
+        cv2.putText(img, identity,(10,500), cv2.FONT_HERSHEY_SIMPLEX , 4,(255,255,255),2,cv2.LINE_AA)
 
         if identity is not None:
             identities.append(identity)
@@ -100,7 +108,7 @@ def process_frame(img, frame):
 
     return img
 
-def find_identity(frame, x1, y1, x2, y2):
+def find_identity(frame, x,y,w,h):
     """
     Determine whether the face contained within the bounding box exists in our database
 
@@ -112,7 +120,7 @@ def find_identity(frame, x1, y1, x2, y2):
     """
     height, width, channels = frame.shape
     # The padding is necessary since the OpenCV face detector creates the bounding box around the face and not the head
-    part_image = frame[max(0, y1):min(height, y2), max(0, x1):min(width, x2)]
+    part_image = frame[y:y+h, x:x+w]
 
     return who_is_it(part_image, database, FRmodel)
 
@@ -136,10 +144,11 @@ def who_is_it(image, database, model):
             min_dist = dist
             identity = name
 
-    if min_dist > 1.10:
+    if min_dist > 0.1:
         return None
     else:
-        return str(identity)
+        print(identity)
+        return identity
 
     # Allow the program to start detecting identities again
     ready_to_detect_identity = True
